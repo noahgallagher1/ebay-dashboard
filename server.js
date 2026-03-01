@@ -1,29 +1,55 @@
-require('dotenv').config();
+/**
+ * eBay Vintage Dashboard - Backend API Server
+ * Handles OAuth token management & eBay API proxying
+ * Backend: Railway.app  |  Frontend: Hostinger shared hosting
+ */
+
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const qs = require('qs');
+const path = require('path');
 
 const app = express();
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
+
+// CORS — allows your Hostinger domain to call this Railway backend
+// Set CORS_ORIGIN in Railway variables to your Hostinger domain, e.g. https://yourdomain.com
+const allowedOrigins = (process.env.CORS_ORIGIN || '*').split(',').map(s => s.trim());
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (Railway health checks, curl, etc.)
+    if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked: ${origin}`));
+    }
+  },
+  credentials: true,
+}));
+
 app.use(express.json());
+// Serve static files only if running locally (Railway won't use this)
+app.use(express.static(path.join(__dirname, 'public')));
 
 // ============================================================
-// CONFIGURATION
+// CONFIG — Replace with your eBay Developer credentials
 // ============================================================
-const EBAY_SANDBOX = process.env.EBAY_SANDBOX === 'true';
-const BASE_URL = EBAY_SANDBOX
+const EBAY_CONFIG = {
+  clientId:     process.env.EBAY_CLIENT_ID     || 'YOUR_CLIENT_ID',
+  clientSecret: process.env.EBAY_CLIENT_SECRET || 'YOUR_CLIENT_SECRET',
+  ruName:       process.env.EBAY_RU_NAME       || 'YOUR_RU_NAME',
+  // Set to false when ready for production
+  sandbox: process.env.EBAY_SANDBOX === 'true' || false,
+};
+
+const BASE_URL = EBAY_CONFIG.sandbox
   ? 'https://api.sandbox.ebay.com'
   : 'https://api.ebay.com';
-const AUTH_URL = EBAY_SANDBOX
+
+const AUTH_URL = EBAY_CONFIG.sandbox
   ? 'https://auth.sandbox.ebay.com'
   : 'https://auth.ebay.com';
 
-const CLIENT_ID = process.env.EBAY_CLIENT_ID;
-const CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
-const RU_NAME = process.env.EBAY_RU_NAME;
-
-// In-memory token store
+// In-memory token store (use Redis/DB in production)
 let tokenStore = {
   accessToken: null,
   refreshToken: process.env.EBAY_REFRESH_TOKEN || null,
@@ -31,47 +57,31 @@ let tokenStore = {
 };
 
 // ============================================================
-// TOKEN MANAGEMENT
+// OAUTH HELPERS
 // ============================================================
-async function getAccessToken() {
-  const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
-  const response = await axios.post(
-    `${AUTH_URL}/oauth2/token`,
-    qs.stringify({
-      grant_type: 'client_credentials',
-      scope: 'https://api.ebay.com/oauth/api_scope',
-    }),
-    {
-      headers: {
-        Authorization: `Basic ${credentials}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-    }
-  );
-  return response.data.access_token;
+function getBase64Credentials() {
+  return Buffer.from(`${EBAY_CONFIG.clientId}:${EBAY_CONFIG.clientSecret}`).toString('base64');
 }
 
 async function refreshAccessToken() {
   if (!tokenStore.refreshToken) {
-    throw new Error('No refresh token available. Please authenticate via /auth/ebay');
+    throw new Error('No refresh token available. Complete OAuth flow first.');
   }
-  const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
+
   const response = await axios.post(
-    `${AUTH_URL}/oauth2/token`,
-    qs.stringify({
-      grant_type: 'refresh_token',
-      refresh_token: tokenStore.refreshToken,
-      scope: 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly https://api.ebay.com/oauth/api_scope/sell.finances https://api.ebay.com/oauth/api_scope/sell.inventory.readonly https://api.ebay.com/oauth/api_scope/sell.analytics.readonly',
-    }),
+    `${BASE_URL}/identity/v1/oauth2/token`,
+    `grant_type=refresh_token&refresh_token=${tokenStore.refreshToken}`,
     {
       headers: {
-        Authorization: `Basic ${credentials}`,
         'Content-Type': 'application/x-www-form-urlencoded',
+        'Authorization': `Basic ${getBase64Credentials()}`,
       },
     }
   );
+
   tokenStore.accessToken = response.data.access_token;
-  tokenStore.expiresAt = Date.now() + (response.data.expires_in - 60) * 1000;
+  tokenStore.expiresAt = Date.now() + (response.data.expires_in * 1000) - 60000;
+  console.log('✅ Access token refreshed');
   return tokenStore.accessToken;
 }
 
@@ -85,78 +95,74 @@ async function getValidToken() {
 // ============================================================
 // OAUTH ROUTES
 // ============================================================
+
+// Step 1: Redirect user to eBay login
 app.get('/auth/ebay', (req, res) => {
   const scopes = [
     'https://api.ebay.com/oauth/api_scope',
-    'https://api.ebay.com/oauth/api_scope/sell.fulfillment.readonly',
     'https://api.ebay.com/oauth/api_scope/sell.finances',
-    'https://api.ebay.com/oauth/api_scope/sell.inventory.readonly',
+    'https://api.ebay.com/oauth/api_scope/sell.fulfillment',
+    'https://api.ebay.com/oauth/api_scope/sell.inventory',
     'https://api.ebay.com/oauth/api_scope/sell.analytics.readonly',
+    'https://api.ebay.com/oauth/api_scope/sell.account',
   ].join(' ');
 
-  const authUrl = `${AUTH_URL}/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(RU_NAME)}&scope=${encodeURIComponent(scopes)}`;
+  const authUrl = `${AUTH_URL}/oauth2/authorize?client_id=${EBAY_CONFIG.clientId}&redirect_uri=${encodeURIComponent(EBAY_CONFIG.ruName)}&response_type=code&scope=${encodeURIComponent(scopes)}`;
   res.redirect(authUrl);
 });
 
+// Step 2: eBay redirects here with auth code
 app.get('/auth/ebay/callback', async (req, res) => {
   const { code } = req.query;
-  if (!code) {
-    return res.status(400).json({ error: 'No authorization code received' });
-  }
+  if (!code) return res.status(400).json({ error: 'No authorization code received' });
 
   try {
-    const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
     const response = await axios.post(
-      `${AUTH_URL}/oauth2/token`,
-      qs.stringify({
-        grant_type: 'authorization_code',
-        code,
-        redirect_uri: RU_NAME,
-      }),
+      `${BASE_URL}/identity/v1/oauth2/token`,
+      `grant_type=authorization_code&code=${code}&redirect_uri=${encodeURIComponent(EBAY_CONFIG.ruName)}`,
       {
         headers: {
-          Authorization: `Basic ${credentials}`,
           'Content-Type': 'application/x-www-form-urlencoded',
+          'Authorization': `Basic ${getBase64Credentials()}`,
         },
       }
     );
 
     tokenStore.accessToken = response.data.access_token;
     tokenStore.refreshToken = response.data.refresh_token;
-    tokenStore.expiresAt = Date.now() + (response.data.expires_in - 60) * 1000;
+    tokenStore.expiresAt = Date.now() + (response.data.expires_in * 1000) - 60000;
 
-    console.log('\n🔑 REFRESH TOKEN (save this to your Railway variables):');
-    console.log('EBAY_REFRESH_TOKEN=' + tokenStore.refreshToken);
-    console.log('\n');
+    // Redirect back to your Hostinger frontend after auth
+    const frontendUrl = process.env.FRONTEND_URL || 'https://your-hostinger-domain.com';
+    console.log('🎉 OAuth complete! Refresh token:', tokenStore.refreshToken);
+    console.log('👉 Add EBAY_REFRESH_TOKEN=' + tokenStore.refreshToken + ' to your Railway variables');
 
-    // Redirect to Hostinger frontend
-    const frontendUrl = process.env.CORS_ORIGIN || 'http://localhost:3000';
-    res.redirect(frontendUrl + '?auth=success');
+    res.redirect(`${frontendUrl}/?auth=success`);
   } catch (err) {
-    console.error('Auth error:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Authentication failed', details: err.response?.data });
+    console.error('OAuth error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'OAuth failed', details: err.response?.data });
   }
 });
 
 app.get('/auth/status', (req, res) => {
   res.json({
-    authenticated: !!(tokenStore.accessToken && Date.now() < tokenStore.expiresAt),
+    connected: !!tokenStore.accessToken && Date.now() < (tokenStore.expiresAt || 0),
     hasRefreshToken: !!tokenStore.refreshToken,
     expiresAt: tokenStore.expiresAt,
   });
 });
 
 // ============================================================
-// API PROXY ROUTES
+// eBay API ROUTES
 // ============================================================
 
-// Get orders
+// Get seller transactions / orders
 app.get('/api/orders', async (req, res) => {
   try {
     const token = await getValidToken();
     const { limit = 50, offset = 0, filter } = req.query;
 
-    let url = `${BASE_URL}/sell/fulfillment/v1/order?limit=${limit}&offset=${offset}`;
+    let url = `${BASE_URL}/sell/fulfillment/v1/order?limit=${limit}&offset=${offset}&orderingContext=BUYER_CHECKOUT`;
     if (filter) url += `&filter=${filter}`;
 
     const response = await axios.get(url, {
@@ -166,11 +172,11 @@ app.get('/api/orders', async (req, res) => {
     res.json(response.data);
   } catch (err) {
     console.error('Orders error:', err.response?.data || err.message);
-    res.status(err.response?.status || 500).json({ error: err.message });
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
   }
 });
 
-// Get financial transactions
+// Get financial transactions (payouts, sales)
 app.get('/api/finances', async (req, res) => {
   try {
     const token = await getValidToken();
@@ -184,15 +190,15 @@ app.get('/api/finances', async (req, res) => {
     res.json(response.data);
   } catch (err) {
     console.error('Finances error:', err.response?.data || err.message);
-    res.status(err.response?.status || 500).json({ error: err.message });
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
   }
 });
 
-// Get listings
+// Get active listings
 app.get('/api/listings', async (req, res) => {
   try {
     const token = await getValidToken();
-    const { limit = 50, offset = 0 } = req.query;
+    const { limit = 100, offset = 0 } = req.query;
 
     const url = `${BASE_URL}/sell/inventory/v1/inventory_item?limit=${limit}&offset=${offset}`;
     const response = await axios.get(url, {
@@ -202,15 +208,17 @@ app.get('/api/listings', async (req, res) => {
     res.json(response.data);
   } catch (err) {
     console.error('Listings error:', err.response?.data || err.message);
-    res.status(err.response?.status || 500).json({ error: err.message });
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
   }
 });
 
-// Get traffic analytics
+// Get seller analytics / traffic
 app.get('/api/analytics/traffic', async (req, res) => {
   try {
     const token = await getValidToken();
-    const url = `${BASE_URL}/sell/analytics/v1/traffic_report?dimension=DAY&metric=CLICK_THROUGH_RATE&metric=LISTING_IMPRESSION_STORE&metric=LISTING_VIEWS_SOURCE_TYPE`;
+    const { dimensionKey = 'LISTING', metricKey = 'CLICK_THROUGH_RATE,IMPRESSION_COUNT,LISTING_IMPRESSION_SEARCH_RESULTS_PAGE', dateRange } = req.query;
+
+    const url = `${BASE_URL}/sell/analytics/v1/traffic_report?dimension=${dimensionKey}&metric=${metricKey}`;
     const response = await axios.get(url, {
       headers: { Authorization: `Bearer ${token}` },
     });
@@ -218,7 +226,7 @@ app.get('/api/analytics/traffic', async (req, res) => {
     res.json(response.data);
   } catch (err) {
     console.error('Analytics error:', err.response?.data || err.message);
-    res.status(err.response?.status || 500).json({ error: err.message });
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
   }
 });
 
@@ -227,14 +235,17 @@ app.get('/api/dashboard/stats', async (req, res) => {
   try {
     const token = await getValidToken();
 
-    const [orders, transactions] = await Promise.all([
-      axios.get(`${BASE_URL}/sell/fulfillment/v1/order?limit=200`, {
-        headers: { Authorization: `Bearer ${token}` },
-      }).then(r => r.data).catch(() => ({ orders: [], total: 0 })),
-      axios.get(`${BASE_URL}/sell/finances/v1/transaction?limit=200&transactionType=SALE`, {
-        headers: { Authorization: `Bearer ${token}` },
-      }).then(r => r.data).catch(() => ({ transactions: [] })),
+    // Fetch last 30 days of transactions
+    const financeUrl = `${BASE_URL}/sell/finances/v1/transaction?limit=200&transactionType=SALE`;
+    const ordersUrl = `${BASE_URL}/sell/fulfillment/v1/order?limit=50`;
+
+    const [finRes, ordRes] = await Promise.allSettled([
+      axios.get(financeUrl, { headers: { Authorization: `Bearer ${token}` } }),
+      axios.get(ordersUrl, { headers: { Authorization: `Bearer ${token}` } }),
     ]);
+
+    const transactions = finRes.status === 'fulfilled' ? finRes.value.data : { transactions: [] };
+    const orders = ordRes.status === 'fulfilled' ? ordRes.value.data : { orders: [] };
 
     // Compute aggregate stats
     const txList = transactions.transactions || [];
@@ -256,16 +267,18 @@ app.get('/api/dashboard/stats', async (req, res) => {
   }
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', sandbox: EBAY_SANDBOX, authenticated: !!tokenStore.accessToken });
-});
+// ============================================================
+// HEALTH CHECK — Railway uses this to confirm app is running
+// ============================================================
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
+app.get('/', (req, res) => res.json({ status: 'DEFJAMSLAM eBay Dashboard API running ✅' }));
 
 // ============================================================
-// START SERVER
+// START SERVER — must bind to 0.0.0.0 for Railway
 // ============================================================
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 eBay Dashboard running on http://localhost:${PORT}`);
-  console.log(`🔑 To connect eBay: visit http://localhost:${PORT}/auth/ebay`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 eBay Dashboard API running on port ${PORT}`);
+  console.log(`🔑 To connect eBay: visit /auth/ebay`);
+  console.log(`🌍 CORS allowed origins: ${process.env.CORS_ORIGIN || '*'}`);
 });
